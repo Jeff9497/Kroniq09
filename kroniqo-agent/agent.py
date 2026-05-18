@@ -32,6 +32,12 @@ try:
 except ImportError:
     AUTO_JUDGE_AVAILABLE = False
 
+try:
+    from tool_manager import handle_tool_intent, load_capabilities, TOOL_REGISTRY, is_installed
+    TOOL_MANAGER_AVAILABLE = True
+except ImportError:
+    TOOL_MANAGER_AVAILABLE = False
+
 BACKENDS = {
     "claude":   {"url": "https://api.anthropic.com/v1/messages", "model": "claude-sonnet-4-20250514", "key_env": "ANTHROPIC_API_KEY", "style": "anthropic"},
     "gemini":   {"url": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", "model": "gemini-2.0-flash", "key_env": "GEMINI_API_KEY", "style": "openai", "note": "1,500 req/day free"},
@@ -286,6 +292,22 @@ def handle_setup_intent(text):
 
     return handled
 
+# ── UI server thread ─────────────────────────────────────────────────────────
+def _start_ui_server():
+    try:
+        import subprocess as _sp
+        ui_script = Path(__file__).parent.parent / 'kroniqo-ui' / 'api_server.py'
+        if ui_script.exists():
+            _ui = threading.Thread(
+                target=lambda: _sp.run([sys.executable, str(ui_script)], capture_output=True),
+                daemon=True, name="UIServer"
+            )
+            _ui.start()
+            print("  [UI] Dashboard -> http://localhost:7842\n")
+    except Exception as e:
+        pass  # UI is optional
+
+
 # ── Telegram thread ───────────────────────────────────────────────────────────
 _tg_thread = None
 
@@ -317,6 +339,7 @@ Paste any API key or Telegram token to configure automatically.
 
 if __name__ == "__main__":
     _start_telegram_thread()
+    _start_ui_server()
     backend = DEFAULT_BACKEND
 
     print("╔══════════════════════════════════════╗")
@@ -381,7 +404,11 @@ if __name__ == "__main__":
             print(HELP)
         else:
             if not handle_setup_intent(user_input):
-                domain = detect_domain(user_input)
-                print(f"  [auto-domain: {domain}]")
-                try: ask(domain, user_input, backend)
-                except RuntimeError: pass
+                # Check tool installation intent
+                if TOOL_MANAGER_AVAILABLE and handle_tool_intent(user_input):
+                    pass
+                else:
+                    domain = detect_domain(user_input)
+                    print(f"  [auto-domain: {domain}]")
+                    try: ask(domain, user_input, backend)
+                    except RuntimeError: pass

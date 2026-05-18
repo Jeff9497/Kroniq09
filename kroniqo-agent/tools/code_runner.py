@@ -14,15 +14,51 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'kroniqo-
 from consequence_graph import log_decision, record_outcome
 
 
-def run_python(code: str, timeout: int = 10) -> dict:
-    """Run Python code string in subprocess. Returns result dict."""
+# Dangerous patterns — block before running
+_BLOCKED_PATTERNS = [
+    "os.system", "os.remove", "os.rmdir", "shutil.rmtree",
+    "subprocess.call", "subprocess.Popen", "__import__('os').system",
+    "open('/etc", "open('/root", "open('/sys",
+    "rm -rf", "format(", ":(){:|:&};:",  # fork bomb
+]
+
+def _is_safe(code: str) -> tuple[bool, str]:
+    """Basic static check before running code."""
+    for pattern in _BLOCKED_PATTERNS:
+        if pattern in code:
+            return False, f"Blocked pattern detected: {pattern}"
+    return True, ""
+
+
+def run_python(code: str, timeout: int = 10, sandbox: bool = True) -> dict:
+    """
+    Run Python code string in subprocess.
+    sandbox=True blocks dangerous patterns before execution.
+    Returns result dict.
+    """
+    if sandbox:
+        safe, reason = _is_safe(code)
+        if not safe:
+            return {
+                "success": False,
+                "stdout": "",
+                "stderr": f"[Sandbox] Blocked: {reason}",
+                "returncode": -2,
+            }
+
     with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
         f.write(code)
         tmp_path = f.name
     try:
         result = subprocess.run(
             [sys.executable, tmp_path],
-            capture_output=True, text=True, timeout=timeout
+            capture_output=True, text=True, timeout=timeout,
+            # Restrict environment — no access to secrets
+            env={
+                "PATH": os.environ.get("PATH", ""),
+                "PYTHONPATH": os.environ.get("PYTHONPATH", ""),
+                "HOME": os.environ.get("HOME", ""),
+            }
         )
         return {
             "success":    result.returncode == 0,
@@ -31,9 +67,10 @@ def run_python(code: str, timeout: int = 10) -> dict:
             "returncode": result.returncode,
         }
     except subprocess.TimeoutExpired:
-        return {"success": False, "stdout": "", "stderr": f"Timeout after {timeout}s", "returncode": -1}
+        return {"success": False, "stdout": "", "stderr": f"Sandbox: Timeout after {timeout}s", "returncode": -1}
     finally:
-        os.unlink(tmp_path)
+        try: os.unlink(tmp_path)
+        except: pass
 
 
 def extract_code_block(text: str) -> str:
