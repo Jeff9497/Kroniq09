@@ -253,7 +253,15 @@ async def cmd_backends(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ── Main ──────────────────────────────────────────────────────────────────────
 async def _run_bot(token):
     """Async bot runner — works safely in background threads."""
-    app = Application.builder().token(token).build()
+    import httpx
+    # Longer timeouts for mobile/Termux connections
+    app = (Application.builder()
+           .token(token)
+           .connect_timeout(30)
+           .read_timeout(30)
+           .write_timeout(30)
+           .pool_timeout(30)
+           .build())
     app.add_handler(CommandHandler("start",     cmd_start))
     app.add_handler(CommandHandler("ask",       cmd_ask))
     app.add_handler(CommandHandler("debug",     cmd_debug))
@@ -283,15 +291,26 @@ def run_telegram():
         return False
 
     # Create a new event loop for this thread
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        loop.run_until_complete(_run_bot(token))
-    except Exception as e:
-        if "cancel" not in str(e).lower():
-            print(f"[Telegram] Error: {e}")
-    finally:
-        loop.close()
+    import time
+    retry = 0
+    while retry < 5:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(_run_bot(token))
+            break
+        except Exception as e:
+            err = str(e).lower()
+            if "cancel" in err or "keyboard" in err:
+                break
+            retry += 1
+            wait = min(30, 5 * retry)
+            print(f"[Telegram] Error: {e} — retrying in {wait}s ({retry}/5)")
+            loop.close()
+            time.sleep(wait)
+        finally:
+            try: loop.close()
+            except: pass
     return True
 
 

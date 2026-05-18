@@ -115,13 +115,16 @@ def ask(domain, task, backend=DEFAULT_BACKEND):
     print(f"{'='*60}")
     print(answer)
     print(f"\nDecision ID : {decision_id}  |  Confidence: {confidence}")
-    if AUTO_JUDGE_AVAILABLE:
+    # Skip autojudge for general/conversational — no factual outcome to verify
+    if AUTO_JUDGE_AVAILABLE and domain != "general":
         print("  [AutoJudge running...]")
         verdict = auto_judge(decision_id, domain, task, answer)
         if verdict in ("correct", "wrong"):
             print("  [AutoJudge] Recorded automatically.")
         else:
             print(f"  To record manually: outcome {decision_id} correct/wrong")
+    elif domain == "general":
+        print(f"  [Conversational — no outcome needed]")
     else:
         print(f"  To record outcome: outcome {decision_id} correct/wrong")
     print(f"{'='*60}\n")
