@@ -1,29 +1,16 @@
 """
 kroniqo-agent/telegram_bot.py
-Kroniqo as a Telegram bot.
-Commands:
-  /ask <domain> <question>   — ask Kroniqo anything
-  /debug <paste code>        — Kroniqo fixes and runs the code
-  /outcome <id> <correct/wrong> — record an outcome manually
-  /biography                 — show Kroniqo's current biography
-  /backend <name>            — switch backend
-  /backends                  — list all backends
-
-Setup:
-  pip install python-telegram-bot requests
-  set TELEGRAM_BOT_TOKEN=your_token
-  set GROQ_API_KEY=your_key   (or any other backend key)
-  python telegram_bot.py
-
-Get a bot token: message @BotFather on Telegram → /newbot
+Kroniqo Telegram Bot — run alongside or instead of CLI.
+Features: typing indicator, reaction on receive, natural chat.
 """
 
 import os
 import sys
 import logging
+import asyncio
 from pathlib import Path
 
-# Auto-load .env config if present
+# Auto-load .env
 _env_file = Path(__file__).parent / ".env"
 if _env_file.exists():
     for _line in _env_file.read_text().splitlines():
@@ -36,25 +23,40 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'kroniqo-core')
 sys.path.insert(0, os.path.dirname(__file__))
 
 from consequence_graph import record_outcome, get_biography
-from agent import ask, show_biography, BACKENDS, DEFAULT_BACKEND, build_system_prompt
-from tools.code_runner import debug_task, run_python, extract_code_block
+from agent import ask, BACKENDS, DEFAULT_BACKEND, build_system_prompt
+from tools.code_runner import debug_task
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.WARNING)
 
 try:
-    from telegram import Update
+    from telegram import Update, ReactionTypeEmoji
     from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+    from telegram.constants import ChatAction
     TELEGRAM_OK = True
 except ImportError:
     TELEGRAM_OK = False
-    print("[!] python-telegram-bot not installed.")
-    print("    Run: pip install python-telegram-bot")
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 active_backend = DEFAULT_BACKEND
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Send typing indicator then answer ─────────────────────────────────────────
+async def send_typing_then_reply(update: Update, reply_fn):
+    """Show typing... then send the reply."""
+    await update.message.chat.send_action(ChatAction.TYPING)
+    await reply_fn()
+
+
+# ── React to message (thumb up = received) ───────────────────────────────────
+async def react_received(update: Update):
+    """React with 👍 to show message received."""
+    try:
+        await update.message.set_reaction([ReactionTypeEmoji("👍")])
+    except Exception:
+        pass  # reactions may not be supported in all chat types
+
+
+# ── Biography text ────────────────────────────────────────────────────────────
 def bio_text() -> str:
     bio = get_biography()
     lines = [
@@ -74,35 +76,94 @@ def bio_text() -> str:
 
 # ── Handlers ──────────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await react_received(update)
     await update.message.reply_text(
         "*Kroniqo* — AI that ages through experience\n\n"
-        "Commands:\n"
-        "`/ask <domain> <question>` — ask anything\n"
-        "`/debug` — paste broken code and I'll fix + run it\n"
-        "`/outcome <id> correct/wrong` — record a result\n"
-        "`/biography` — see my track record\n"
+        "Just message me naturally, or use commands:\n"
+        "`/ask <domain> <question>`\n"
+        "`/debug` — paste broken code, I fix and run it\n"
+        "`/outcome <id> correct/wrong`\n"
+        "`/biography` — my track record\n"
         "`/backend <name>` — switch model\n"
-        "`/backends` — list available models",
+        "`/backends` — available models",
         parse_mode="Markdown"
     )
 
 
+async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle natural chat messages — mirrors CLI free chat mode."""
+    text = update.message.text.strip()
+    if not text:
+        return
+
+    # React immediately to show received
+    await react_received(update)
+
+    # Show typing
+    await update.message.chat.send_action(ChatAction.TYPING)
+
+    # Import domain detection and setup handler from agent
+    from agent import detect_domain, handle_setup_intent
+
+    # Check setup intent first
+    setup_handled = handle_setup_intent(text)
+    if setup_handled:
+        config = {}
+        env_file = Path(__file__).parent / ".env"
+        if env_file.exists():
+            for line in env_file.read_text().splitlines():
+                if "=" in line and not line.startswith("#"):
+                    k, v = line.split("=", 1)
+                    config[k.strip()] = v.strip()
+        await update.message.reply_text("Configuration updated. Check terminal for details.")
+        return
+
+    # Normal question
+    domain = detect_domain(text)
+
+    try:
+        answer, confidence, decision_id = ask(domain, text, active_backend)
+
+        # Strip CONFIDENCE line from display
+        display = "\n".join(
+            line for line in answer.split("\n")
+            if not line.strip().upper().startswith("CONFIDENCE:")
+        ).strip()
+
+        await update.message.reply_text(
+            f"{display}\n\n"
+            f"_Domain: {domain} | Confidence: {confidence} | ID: {decision_id}_",
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        await update.message.reply_text(f"Error: {e}")
+
+
 async def cmd_ask(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await react_received(update)
     args = ctx.args
     if len(args) < 2:
-        await update.message.reply_text("Usage: `/ask <domain> <question>`\nExample: `/ask geography What is the capital of Kenya?`", parse_mode="Markdown")
+        await update.message.reply_text(
+            "Usage: `/ask <domain> <question>`\nExample: `/ask trivia Who won the 1966 World Cup?`",
+            parse_mode="Markdown"
+        )
         return
 
     domain = args[0]
-    task   = " ".join(args[1:])
-    await update.message.reply_text(f"_Thinking... [{active_backend.upper()}]_", parse_mode="Markdown")
+    task = " ".join(args[1:])
+    await update.message.chat.send_action(ChatAction.TYPING)
 
     try:
         answer, confidence, decision_id = ask(domain, task, active_backend)
+        display = "\n".join(
+            line for line in answer.split("\n")
+            if not line.strip().upper().startswith("CONFIDENCE:")
+        ).strip()
+
         await update.message.reply_text(
-            f"{answer}\n\n"
-            f"_Decision ID: {decision_id} | Confidence: {confidence}_\n"
-            f"_Verify and reply `/outcome {decision_id} correct` or `/outcome {decision_id} wrong`_",
+            f"{display}\n\n"
+            f"_Confidence: {confidence} | ID: {decision_id}_\n"
+            f"_Reply `/outcome {decision_id} correct` or `/outcome {decision_id} wrong`_",
             parse_mode="Markdown"
         )
     except Exception as e:
@@ -110,90 +171,93 @@ async def cmd_ask(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_debug(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """User pastes broken code after /debug"""
+    await react_received(update)
     if not ctx.args:
         await update.message.reply_text(
-            "Paste your broken code after /debug:\n"
-            "`/debug\ndef add(a, b)\n    return a + b`",
+            "Paste broken code after /debug:\n`/debug def f(a,b)\\n    return a ++ b`",
             parse_mode="Markdown"
         )
         return
 
     broken_code = " ".join(ctx.args).replace("\\n", "\n")
-    await update.message.reply_text("_Running your code and debugging..._", parse_mode="Markdown")
-
+    await update.message.chat.send_action(ChatAction.TYPING)
     result = debug_task(broken_code, ask, active_backend)
 
     if result["status"] == "already_works":
-        await update.message.reply_text("Your code already works — no fix needed.")
+        await update.message.reply_text("Code already works — no fix needed.")
     elif result["status"] == "correct":
         await update.message.reply_text(
-            f"*Fixed!* Here's the working code:\n\n"
-            f"```python\n{result['fixed_code']}\n```\n\n"
+            f"*Fixed!*\n\n```python\n{result['fixed_code']}\n```\n\n"
             f"Output: `{result['result']['stdout'][:200]}`\n"
-            f"_Outcome auto-recorded as correct. Kroniqo has aged._",
+            f"_Auto-recorded as correct. Kroniqo aged._",
             parse_mode="Markdown"
         )
     else:
         await update.message.reply_text(
-            f"*Fix failed.* My suggested fix:\n\n"
-            f"```python\n{result['fixed_code']}\n```\n\n"
-            f"Still erroring: `{result['result']['stderr'][:200]}`\n"
-            f"_Outcome auto-recorded as wrong. Kroniqo has aged._",
+            f"*Fix failed.*\n\n```python\n{result['fixed_code']}\n```\n\n"
+            f"Error: `{result['result']['stderr'][:200]}`\n"
+            f"_Auto-recorded as wrong. Kroniqo aged._",
             parse_mode="Markdown"
         )
 
 
 async def cmd_outcome(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await react_received(update)
     if len(ctx.args) < 2:
-        await update.message.reply_text("Usage: `/outcome <decision_id> <correct/wrong/partial>`", parse_mode="Markdown")
+        await update.message.reply_text("Usage: `/outcome <id> <correct/wrong>`", parse_mode="Markdown")
         return
     try:
-        did     = int(ctx.args[0])
+        did = int(ctx.args[0])
         outcome = ctx.args[1].lower()
-        mag     = ctx.args[2] if len(ctx.args) > 2 else "medium"
+        mag = ctx.args[2] if len(ctx.args) > 2 else "medium"
         record_outcome(did, outcome, mag)
-        await update.message.reply_text(f"Recorded: Decision {did} → *{outcome}*. Kroniqo has aged.", parse_mode="Markdown")
-    except (ValueError, IndexError):
+        await update.message.reply_text(
+            f"Decision {did} recorded as *{outcome}*. Kroniqo has aged.",
+            parse_mode="Markdown"
+        )
+    except ValueError:
         await update.message.reply_text("Invalid. Use: `/outcome 3 correct`", parse_mode="Markdown")
 
 
 async def cmd_biography(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await react_received(update)
+    await update.message.chat.send_action(ChatAction.TYPING)
     await update.message.reply_text(bio_text(), parse_mode="Markdown")
 
 
 async def cmd_backend(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     global active_backend
+    await react_received(update)
     if not ctx.args:
-        await update.message.reply_text(f"Current backend: *{active_backend}*\nUse `/backends` to see all.", parse_mode="Markdown")
+        await update.message.reply_text(f"Current backend: *{active_backend}*", parse_mode="Markdown")
         return
     choice = ctx.args[0].lower()
     if choice in BACKENDS:
         active_backend = choice
         await update.message.reply_text(f"Switched to *{active_backend.upper()}*", parse_mode="Markdown")
     else:
-        await update.message.reply_text(f"Unknown backend. Options: {list(BACKENDS.keys())}")
+        await update.message.reply_text(f"Unknown. Options: {list(BACKENDS.keys())}")
 
 
 async def cmd_backends(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await react_received(update)
     lines = ["*Available Backends:*"]
     for name, cfg in BACKENDS.items():
-        key_set = "✓" if os.environ.get(cfg["key_env"]) else "✗"
-        active  = " ← active" if name == active_backend else ""
-        note    = cfg.get("note", "")
+        key_set = "✓" if os.environ.get(cfg["key_env"], "").strip() else "✗"
+        active = " ← active" if name == active_backend else ""
+        note = cfg.get("note", "")
         lines.append(f"{key_set} `{name}` — {note}{active}")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
-def main():
+def run_telegram():
     if not TELEGRAM_OK:
-        print("Install: pip install python-telegram-bot")
-        return
+        print("[!] Install: pip install python-telegram-bot")
+        return False
     if not BOT_TOKEN:
-        print("Set TELEGRAM_BOT_TOKEN environment variable")
-        print("Get token from @BotFather on Telegram")
-        return
+        print("[!] No TELEGRAM_BOT_TOKEN — run agent.py and paste your token to configure")
+        return False
 
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start",     cmd_start))
@@ -203,11 +267,12 @@ def main():
     app.add_handler(CommandHandler("biography", cmd_biography))
     app.add_handler(CommandHandler("backend",   cmd_backend))
     app.add_handler(CommandHandler("backends",  cmd_backends))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    print(f"Kroniqo Telegram Bot running — backend: {active_backend.upper()}")
-    print("Press Ctrl+C to stop")
-    app.run_polling()
+    print(f"[Telegram] @Kroniq09_bot running — backend: {active_backend.upper()}")
+    app.run_polling(drop_pending_updates=True)
+    return True
 
 
 if __name__ == "__main__":
-    main()
+    run_telegram()
