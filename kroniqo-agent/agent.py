@@ -293,19 +293,75 @@ def handle_setup_intent(text):
     return handled
 
 # ── UI server thread ─────────────────────────────────────────────────────────
-def _start_ui_server():
+def _run_ui_server():
+    """Run the UI API server directly in this thread — no subprocess."""
     try:
-        import subprocess as _sp
-        ui_script = Path(__file__).parent.parent / 'kroniqo-ui' / 'api_server.py'
-        if ui_script.exists():
-            _ui = threading.Thread(
-                target=lambda: _sp.run([sys.executable, str(ui_script)], capture_output=True),
-                daemon=True, name="UIServer"
-            )
-            _ui.start()
-            print("  [UI] Dashboard -> http://localhost:7842\n")
+        ui_dir = Path(__file__).parent.parent / 'kroniqo-ui'
+        if not ui_dir.exists():
+            return
+        # Import and run inline
+        sys.path.insert(0, str(Path(__file__).parent.parent / 'kroniqo-core'))
+        from consequence_graph import get_biography
+        import sqlite3, json
+        from http.server import HTTPServer, SimpleHTTPRequestHandler
+        from urllib.parse import urlparse
+
+        DB_PATH = Path(__file__).parent.parent / 'kroniqo-core' / 'kroniqo.db'
+        PORT = 7842
+
+        def get_decisions(limit=50):
+            if not DB_PATH.exists():
+                return []
+            conn = sqlite3.connect(DB_PATH)
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            c.execute("SELECT id,timestamp,domain,task,confidence_expressed,outcome,magnitude,notes FROM consequences ORDER BY id DESC LIMIT ?", (limit,))
+            rows = [dict(r) for r in c.fetchall()]
+            conn.close()
+            return rows
+
+        class Handler(SimpleHTTPRequestHandler):
+            def __init__(self, *a, **kw):
+                super().__init__(*a, directory=str(ui_dir), **kw)
+            def do_GET(self):
+                p = urlparse(self.path).path
+                if p == '/api/biography':
+                    self._j(get_biography())
+                elif p == '/api/decisions':
+                    self._j(get_decisions())
+                elif p == '/api/status':
+                    bio = get_biography()
+                    self._j({"age": bio["age"], "domains": len(bio.get("domains", {}))})
+                else:
+                    super().do_GET()
+            def _j(self, data):
+                body = json.dumps(data).encode()
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', len(body))
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                self.wfile.write(body)
+            def log_message(self, *a): pass
+
+        server = HTTPServer(('0.0.0.0', PORT), Handler)
+        server.serve_forever()
+    except OSError as e:
+        if 'Address already in use' in str(e):
+            pass  # already running
+        else:
+            print(f"  [UI] Error: {e}")
     except Exception as e:
-        pass  # UI is optional
+        print(f"  [UI] Error: {e}")
+
+
+def _start_ui_server():
+    ui_dir = Path(__file__).parent.parent / 'kroniqo-ui'
+    if not ui_dir.exists():
+        return
+    t = threading.Thread(target=_run_ui_server, daemon=True, name="UIServer")
+    t.start()
+    print("  [UI] Dashboard -> http://127.0.0.1:7842")
 
 
 # ── Telegram thread ───────────────────────────────────────────────────────────
